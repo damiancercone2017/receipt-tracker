@@ -86,6 +86,8 @@ st.markdown("""
 # ── Session state init ────────────────────────────────────────────────────────
 if "expenses" not in st.session_state:
     st.session_state.expenses = []
+if "confirm_clear" not in st.session_state:
+    st.session_state.confirm_clear = False
 
 # ── API key ───────────────────────────────────────────────────────────────────
 try:
@@ -119,8 +121,20 @@ if scan_clicked and uploaded_files:
         progress.progress((i) / len(uploaded_files), text=f"Scanning {f.name}…")
         try:
             result = extract_from_file(f.read(), f.name, api_key)
-            st.session_state.expenses.append(result)
-            results_log.append(f"✅ {f.name}")
+
+            # Flag likely duplicates using vendor + date + amount.
+            duplicate = any(
+                (existing.get("vendor") or "").strip().lower() == (result.get("vendor") or "").strip().lower()
+                and (existing.get("date") or "") == (result.get("date") or "")
+                and float(existing.get("amount") or 0) == float(result.get("amount") or 0)
+                for existing in st.session_state.expenses
+            )
+
+            if duplicate:
+                results_log.append(f"⚠️ {f.name}: possible duplicate — not added")
+            else:
+                st.session_state.expenses.append(result)
+                results_log.append(f"✅ {f.name}")
         except Exception as e:
             results_log.append(f"❌ {f.name}: {e}")
 
@@ -174,31 +188,91 @@ if expenses:
         e for e in expenses if (e.get("category") or "Other") == selected_cat
     ]
 
-    # Build display dataframe
+    # Build an editable dataframe. Keep the source index so edits map back
+    # to the correct session-state record even when a category filter is used.
+    filtered_pairs = [
+        (idx, e) for idx, e in enumerate(expenses)
+        if selected_cat == "All" or (e.get("category") or "Other") == selected_cat
+    ]
+
     rows = []
-    for e in filtered:
+    for source_index, e in filtered_pairs:
         rows.append({
-            "Date": e.get("date") or "—",
-            "Vendor": e.get("vendor") or "—",
+            "_source_index": source_index,
+            "Delete": False,
+            "Date": e.get("date") or "",
+            "Vendor": e.get("vendor") or "",
             "Category": e.get("category") or "Other",
-            "Amount": f"${e['amount']:,.2f}" if e.get("amount") else "—",
-            "Payment Method": e.get("payment_method") or "—",
+            "Amount": float(e.get("amount") or 0),
+            "Payment Method": e.get("payment_method") or "",
             "Notes": e.get("notes") or "",
-            "⚠️": "Low" if e.get("confidence") == "low" else "✓",
+            "Confidence": "Low" if e.get("confidence") == "low" else "High",
             "File": e.get("source_file") or "",
         })
 
     df = pd.DataFrame(rows)
-    st.dataframe(
+    edited_df = st.data_editor(
         df,
         use_container_width=True,
         hide_index=True,
+        disabled=["_source_index", "Confidence", "File"],
         column_config={
-            "Amount": st.column_config.TextColumn(width="small"),
-            "⚠️": st.column_config.TextColumn("Confidence", width="small"),
+            "_source_index": None,
+            "Delete": st.column_config.CheckboxColumn(
+                "Delete",
+                help="Select rows to remove, then click Save Changes.",
+                default=False,
+                width="small",
+            ),
+            "Date": st.column_config.TextColumn(width="small"),
+            "Vendor": st.column_config.TextColumn(width="medium"),
+            "Category": st.column_config.SelectboxColumn(
+                options=["Meals", "Office Supplies", "Travel", "Software", "Utilities", "Other"],
+                required=True,
+                width="medium",
+            ),
+            "Amount": st.column_config.NumberColumn(
+                format="$%.2f",
+                min_value=0.0,
+                step=0.01,
+                width="small",
+            ),
+            "Payment Method": st.column_config.TextColumn(width="medium"),
             "Notes": st.column_config.TextColumn(width="large"),
-        }
+            "Confidence": st.column_config.TextColumn(width="small"),
+            "File": st.column_config.TextColumn(width="medium"),
+        },
+        key="expense_editor",
     )
+
+    save_col, _ = st.columns([1, 4])
+    with save_col:
+        if st.button("💾 Save Changes", use_container_width=True):
+            delete_indices = set()
+
+            for _, row in edited_df.iterrows():
+                source_index = int(row["_source_index"])
+
+                if bool(row["Delete"]):
+                    delete_indices.add(source_index)
+                    continue
+
+                expense = st.session_state.expenses[source_index]
+                expense["date"] = str(row["Date"]).strip() or None
+                expense["vendor"] = str(row["Vendor"]).strip() or None
+                expense["category"] = str(row["Category"]).strip() or "Other"
+                expense["amount"] = float(row["Amount"]) if pd.notna(row["Amount"]) else None
+                expense["payment_method"] = str(row["Payment Method"]).strip() or None
+                expense["notes"] = str(row["Notes"]).strip() or None
+
+            if delete_indices:
+                st.session_state.expenses = [
+                    expense for idx, expense in enumerate(st.session_state.expenses)
+                    if idx not in delete_indices
+                ]
+
+            st.success("Expense log updated.")
+            st.rerun()
 
     if any(e.get("confidence") == "low" for e in filtered):
         st.caption("⚠️ Rows marked **Low** had ambiguous fields — review and edit as needed.")
@@ -240,6 +314,21 @@ with exp_col2:
         st.button("⬇ Download CSV", disabled=True, use_container_width=True)
 
 with exp_col3:
-    if st.button("🗑 Clear Session", use_container_width=True):
-        st.session_state.expenses = []
-        st.rerun()
+    if expenses and not st.session_state.confirm_clear:
+        if st.button("🗑 Clear Session", use_container_width=True):
+            st.session_state.confirm_clear = True
+            st.rerun()
+    elif expenses:
+        st.warning("Clear all receipts?")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Yes, clear", use_container_width=True):
+                st.session_state.expenses = []
+                st.session_state.confirm_clear = False
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state.confirm_clear = False
+                st.rerun()
+    else:
+        st.button("🗑 Clear Session", disabled=True, use_container_width=True)
